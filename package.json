@@ -1,0 +1,11 @@
+{
+  "name": "ignite-waffle-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Third-party Ignite compiler plugin for Waffle projects (e.g. Uniswap v2-core), bundling solc-js 0.5.16",
+  "main": "index.cjs",
+  "license": "MIT",
+  "dependencies": {
+    "solc": "0.5.16"
+  }
+}
