@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Ignite third-party compiler plugin for Waffle projects (e.g. Uniswap v2-core).
+// Ignite third-party compiler plugin for Waffle projects (e.g. Uniswap
+// v2-core and v2-periphery).
 //
 // Protocol (see Ignite's PluginExecutionUtils / finalizeImage):
 //   - The operation name is the last argv element.
@@ -8,15 +9,24 @@
 //       { success: true, data } | { success: false, error: { code, message } }
 //   - Diagnostics go to stderr only.
 //   - The repository under compilation is mounted at /workspace.
+//   - Ignite provides a persistent per-plugin volume, advertised via
+//     $IGNITE_PLUGIN_CACHE (mounted at /cache).
 //
-// The solc toolchain (solc-js 0.5.16) is bundled in the plugin image, so
-// compilation works without network access and without installing anything
-// into the workspace.
+// solc strategy (hybrid): the image bundles solc-js 0.5.16, 0.6.6, and a
+// modern 0.8.x; the target version is resolved per repo (waffle config, then
+// the workspace package.json solc pin). Any other version is downloaded from
+// binaries.soliditylang.org into the plugin cache — that path needs the
+// Network permission once, then compiles run offline again.
 
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 
-const PLUGIN_VERSION = '0.1.0';
+const execFileAsync = promisify(execFile);
+
+const PLUGIN_VERSION = '0.2.0';
 const META = {
   id: 'waffle',
   type: 'compiler',
@@ -26,7 +36,16 @@ const META = {
 };
 
 const WORKSPACE = process.env.WORKSPACE_PATH || '/workspace';
+const CACHE_DIR = process.env.IGNITE_PLUGIN_CACHE || '';
 const CONFIG_FILES = ['.waffle.json', 'waffle.json'];
+const SOLC_BIN_HOST = 'https://binaries.soliditylang.org/bin';
+
+// soljson binaries baked into the image at npm ci time.
+const BUNDLED_SOLJSON = {
+  '0.5.16': 'solc-0.5.16/soljson.js',
+  '0.6.6': 'solc-0.6.6/soljson.js',
+  [require('solc/package.json').version]: 'solc/soljson.js',
+};
 
 function ok(data) {
   return { success: true, data };
@@ -80,7 +99,7 @@ function collectSources(dir, base) {
     } else if (entry.name.endsWith('.sol')) {
       // Key sources by path relative to the workspace root (e.g.
       // "contracts/UniswapV2Pair.sol") so relative imports between them
-      // resolve within the source set without an import callback.
+      // resolve within the source set.
       const key = path.relative(base, p).split(path.sep).join('/');
       sources[key] = { content: fs.readFileSync(p, 'utf8') };
     }
@@ -114,6 +133,109 @@ function normalizeLinkReferences(linkRefs) {
   return Object.keys(result).length > 0 ? result : undefined;
 }
 
+// --- solc version resolution & loading ---
+
+// Waffle repos usually point compilerVersion at ./node_modules/solc and pin
+// the actual version in package.json (e.g. v2-core: 0.5.16, v2-periphery:
+// 0.6.6). Resolution: explicit semver in the waffle config wins, then the
+// package.json solc pin.
+function resolveSolcVersion(config) {
+  if (
+    typeof config.compilerVersion === 'string' &&
+    /^\d+\.\d+\.\d+$/.test(config.compilerVersion)
+  ) {
+    return config.compilerVersion;
+  }
+  const pkgPath = path.join(WORKSPACE, 'package.json');
+  if (fs.existsSync(pkgPath)) {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    const pin =
+      (pkg.dependencies && pkg.dependencies.solc) ||
+      (pkg.devDependencies && pkg.devDependencies.solc);
+    if (typeof pin === 'string') {
+      const match = pin.match(/\d+\.\d+\.\d+/);
+      if (match) return match[0];
+    }
+  }
+  return null;
+}
+
+function httpsGet(url, redirects = 3) {
+  return new Promise((resolve, reject) => {
+    https
+      .get(url, (res) => {
+        if (
+          res.statusCode >= 300 &&
+          res.statusCode < 400 &&
+          res.headers.location &&
+          redirects > 0
+        ) {
+          res.resume();
+          resolve(httpsGet(res.headers.location, redirects - 1));
+          return;
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          reject(new Error(`GET ${url} -> HTTP ${res.statusCode}`));
+          return;
+        }
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => resolve(Buffer.concat(chunks)));
+        res.on('error', reject);
+      })
+      .on('error', reject);
+  });
+}
+
+async function downloadSoljson(version) {
+  const list = JSON.parse(
+    (await httpsGet(`${SOLC_BIN_HOST}/list.json`)).toString('utf8')
+  );
+  const file = list.releases && list.releases[version];
+  if (!file) {
+    throw new Error(`solc ${version} is not a known release`);
+  }
+  const body = await httpsGet(`${SOLC_BIN_HOST}/${file}`);
+  const dir = CACHE_DIR
+    ? path.join(CACHE_DIR, 'solc-bin')
+    : fs.mkdtempSync(path.join(require('os').tmpdir(), 'solc-'));
+  fs.mkdirSync(dir, { recursive: true });
+  const dest = path.join(dir, `soljson-${version}.js`);
+  // Atomic write so an interrupted download never leaves a corrupt cache hit.
+  const tmp = `${dest}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, body);
+  fs.renameSync(tmp, dest);
+  return dest;
+}
+
+async function loadSolc(version) {
+  const wrapper = require('solc/wrapper');
+  if (BUNDLED_SOLJSON[version]) {
+    return wrapper(require(BUNDLED_SOLJSON[version]));
+  }
+  const cached = CACHE_DIR
+    ? path.join(CACHE_DIR, 'solc-bin', `soljson-${version}.js`)
+    : '';
+  if (cached && fs.existsSync(cached)) {
+    process.stderr.write(`using cached solc ${version}\n`);
+    return wrapper(require(cached));
+  }
+  process.stderr.write(`downloading solc ${version}...\n`);
+  let downloaded;
+  try {
+    downloaded = await downloadSoljson(version);
+  } catch (error) {
+    throw new Error(
+      `solc ${version} is not bundled and could not be downloaded ` +
+        `(${error instanceof Error ? error.message : String(error)}). ` +
+        `Grant the plugin the 'net' permission for one compile so the ` +
+        `compiler can be downloaded and cached.`
+    );
+  }
+  return wrapper(require(downloaded));
+}
+
 // --- operations ---
 
 function getInfo() {
@@ -124,13 +246,42 @@ function detect() {
   return ok({ detected: findConfigPath() !== null });
 }
 
-function install() {
-  // The compiler ships inside the plugin image; there is nothing to install
-  // into the workspace.
-  return ok({});
+// Fetch the workspace's Solidity dependencies (e.g. @uniswap/v2-core for
+// v2-periphery) so package-style imports resolve at compile time. Dev
+// toolchain deps are skipped — the compiler ships in this image. Needs
+// hostWrite (granted for install) and network.
+async function install() {
+  const pkgPath = path.join(WORKSPACE, 'package.json');
+  if (!fs.existsSync(pkgPath)) {
+    return ok({});
+  }
+  const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+  if (!pkg.dependencies || Object.keys(pkg.dependencies).length === 0) {
+    return ok({});
+  }
+
+  const args = ['install', '--omit=dev', '--no-audit', '--no-fund'];
+  if (CACHE_DIR) args.push('--cache', path.join(CACHE_DIR, 'npm'));
+  try {
+    await execFileAsync('npm', args, {
+      cwd: WORKSPACE,
+      maxBuffer: 16 * 1024 * 1024,
+      env: { ...process.env, HOME: CACHE_DIR || '/tmp' },
+    });
+    return ok({});
+  } catch (error) {
+    const stderr = (error && error.stderr) || '';
+    return fail(
+      'INSTALL_FAILED',
+      `npm install failed: ${
+        error instanceof Error ? error.message : String(error)
+      }. If this is a network error, grant the plugin the 'net' permission.`,
+      { stderr: String(stderr).slice(-2000) }
+    );
+  }
 }
 
-function compile() {
+async function compile() {
   const config = loadConfig();
   if (!config) {
     return fail(
@@ -139,16 +290,23 @@ function compile() {
     );
   }
 
-  const solc = require('solc');
-  const solcVersion = solc.version();
-  if (
-    typeof config.compilerVersion === 'string' &&
-    /^\d+\.\d+\.\d+$/.test(config.compilerVersion) &&
-    !solcVersion.startsWith(config.compilerVersion)
-  ) {
-    process.stderr.write(
-      `warning: config requests solc ${config.compilerVersion}, ` +
-        `plugin bundles ${solcVersion}\n`
+  const version = resolveSolcVersion(config);
+  if (!version) {
+    return fail(
+      'SOLC_VERSION_UNRESOLVED',
+      'Could not determine the solc version: set compilerVersion in the ' +
+        'waffle config to an exact version (e.g. "0.6.6") or pin "solc" in ' +
+        'package.json'
+    );
+  }
+
+  let solc;
+  try {
+    solc = await loadSolc(version);
+  } catch (error) {
+    return fail(
+      'SOLC_UNAVAILABLE',
+      error instanceof Error ? error.message : String(error)
     );
   }
 
@@ -178,8 +336,30 @@ function compile() {
   if (config.evmVersion) settings.evmVersion = config.evmVersion;
   if (config.optimizer) settings.optimizer = config.optimizer;
 
+  // solc resolves relative imports against source unit names itself; only
+  // package-style imports (@scope/pkg/...) reach this callback. They resolve
+  // from the workspace's node_modules, populated by the install operation.
+  const nodeModules = path.join(WORKSPACE, 'node_modules');
+  const importCallback = (importPath) => {
+    const abs = path.resolve(nodeModules, importPath);
+    if (!abs.startsWith(nodeModules + path.sep)) {
+      return { error: `Import escapes node_modules: ${importPath}` };
+    }
+    try {
+      return { contents: fs.readFileSync(abs, 'utf8') };
+    } catch {
+      return {
+        error:
+          `Import not found: ${importPath} — run the plugin's install ` +
+          `operation to fetch workspace dependencies`,
+      };
+    }
+  };
+
   const input = { language: 'Solidity', sources, settings };
-  const output = JSON.parse(solc.compile(JSON.stringify(input)));
+  const output = JSON.parse(
+    solc.compile(JSON.stringify(input), { import: importCallback })
+  );
 
   const errors = (output.errors || []).filter((e) => e.severity === 'error');
   if (errors.length > 0) {
@@ -203,7 +383,7 @@ function compile() {
       written++;
     }
   }
-  process.stderr.write(`compiled ${written} contracts with ${solcVersion}\n`);
+  process.stderr.write(`compiled ${written} contracts with solc ${version}\n`);
   return ok({});
 }
 
@@ -219,7 +399,9 @@ function listArtifacts() {
     if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
     let artifact;
     try {
-      artifact = JSON.parse(fs.readFileSync(path.join(outDir, entry.name), 'utf8'));
+      artifact = JSON.parse(
+        fs.readFileSync(path.join(outDir, entry.name), 'utf8')
+      );
     } catch {
       continue;
     }
@@ -231,7 +413,8 @@ function listArtifacts() {
 
     const fallbackName = entry.name.replace(/\.json$/, '');
     const metadata = parseMetadata(artifact);
-    const target = metadata && metadata.settings && metadata.settings.compilationTarget;
+    const target =
+      metadata && metadata.settings && metadata.settings.compilationTarget;
     const sourcePath = target ? Object.keys(target)[0] || '' : '';
     const contractName = target && sourcePath ? target[sourcePath] : fallbackName;
 
@@ -273,8 +456,12 @@ function getArtifactData(options) {
 
   const hex = (obj) => (obj && obj.object ? `0x${obj.object}` : '0x');
 
-  const creationCodeLinkReferences = normalizeLinkReferences(creation.linkReferences);
-  const deployedBytecodeLinkReferences = normalizeLinkReferences(deployed.linkReferences);
+  const creationCodeLinkReferences = normalizeLinkReferences(
+    creation.linkReferences
+  );
+  const deployedBytecodeLinkReferences = normalizeLinkReferences(
+    deployed.linkReferences
+  );
 
   const data = {
     solidityVersion: compiler.version || 'unknown',
@@ -325,7 +512,7 @@ const OPERATIONS = {
   getArtifactData,
 };
 
-function main() {
+async function main() {
   const op = process.argv[process.argv.length - 1];
   const handler = OPERATIONS[op];
   let response;
@@ -334,7 +521,7 @@ function main() {
   } else {
     const options = readOptions();
     try {
-      response = handler(options);
+      response = await handler(options);
     } catch (error) {
       response = fail(
         'PLUGIN_ERROR',
