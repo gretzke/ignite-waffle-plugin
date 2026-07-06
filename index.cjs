@@ -29,13 +29,29 @@ const { spawn } = require('child_process');
 const RESULT_BEGIN = '<<<IGNITE_RESULT_BEGIN>>>';
 const RESULT_END = '<<<IGNITE_RESULT_END>>>';
 
-const PLUGIN_VERSION = '0.3.0';
+const PLUGIN_VERSION = '0.4.0';
 const META = {
   id: 'waffle',
   type: 'compiler',
   name: 'Waffle',
   version: PLUGIN_VERSION,
   baseImage: `ignite/installed_waffle:${PLUGIN_VERSION}`,
+  // Manifest-declared permission requests, shown to the user in Ignite's
+  // grant dialog. Undeclared permissions can never be granted.
+  permissions: [
+    {
+      id: 'hostWrite',
+      description:
+        'Write compiled artifacts to the repository build directory and ' +
+        'install Solidity package dependencies into node_modules.',
+    },
+    {
+      id: 'net',
+      description:
+        'Download solc compiler versions that are not bundled (cached after ' +
+        'the first download) and fetch Solidity package dependencies via npm.',
+    },
+  ],
 };
 
 const WORKSPACE = process.env.WORKSPACE_PATH || '/workspace';
