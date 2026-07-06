@@ -29,11 +29,11 @@ const { spawn } = require('child_process');
 const RESULT_BEGIN = '<<<IGNITE_RESULT_BEGIN>>>';
 const RESULT_END = '<<<IGNITE_RESULT_END>>>';
 
-const PLUGIN_VERSION = '0.5.0';
+const PLUGIN_VERSION = '0.5.1';
 const META = {
   id: 'waffle',
   type: 'compiler',
-  name: 'Waffle Plugin',
+  name: 'Waffle',
   version: PLUGIN_VERSION,
   baseImage: `ignite/installed_waffle:${PLUGIN_VERSION}`,
   // Manifest-declared permission requests, shown to the user in Ignite's
