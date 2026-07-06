@@ -14,11 +14,11 @@
 //   - Ignite provides a persistent per-plugin volume, advertised via
 //     $IGNITE_PLUGIN_CACHE (mounted at /cache).
 //
-// solc strategy (hybrid): the image bundles solc-js 0.5.16, 0.6.6, and a
-// modern 0.8.x; the target version is resolved per repo (waffle config, then
-// the workspace package.json solc pin). Any other version is downloaded from
-// binaries.soliditylang.org into the plugin cache — that path needs the
-// Network permission once, then compiles run offline again.
+// solc strategy: fully dynamic. The target version is resolved per repo
+// (waffle config, then the workspace package.json solc pin) and downloaded
+// from binaries.soliditylang.org into the persistent plugin cache on first
+// use — that path needs the Network permission once per version, then
+// compiles run offline.
 
 const fs = require('fs');
 const path = require('path');
@@ -29,11 +29,11 @@ const { spawn } = require('child_process');
 const RESULT_BEGIN = '<<<IGNITE_RESULT_BEGIN>>>';
 const RESULT_END = '<<<IGNITE_RESULT_END>>>';
 
-const PLUGIN_VERSION = '0.4.0';
+const PLUGIN_VERSION = '0.5.0';
 const META = {
   id: 'waffle',
   type: 'compiler',
-  name: 'Waffle',
+  name: 'Waffle Plugin',
   version: PLUGIN_VERSION,
   baseImage: `ignite/installed_waffle:${PLUGIN_VERSION}`,
   // Manifest-declared permission requests, shown to the user in Ignite's
@@ -48,8 +48,9 @@ const META = {
     {
       id: 'net',
       description:
-        'Download solc compiler versions that are not bundled (cached after ' +
-        'the first download) and fetch Solidity package dependencies via npm.',
+        'Download the solc compiler version a repository needs (cached ' +
+        'after the first download) and fetch Solidity package dependencies ' +
+        'via npm.',
     },
   ],
 };
@@ -58,13 +59,6 @@ const WORKSPACE = process.env.WORKSPACE_PATH || '/workspace';
 const CACHE_DIR = process.env.IGNITE_PLUGIN_CACHE || '';
 const CONFIG_FILES = ['.waffle.json', 'waffle.json'];
 const SOLC_BIN_HOST = 'https://binaries.soliditylang.org/bin';
-
-// soljson binaries baked into the image at npm ci time.
-const BUNDLED_SOLJSON = {
-  '0.5.16': 'solc-0.5.16/soljson.js',
-  '0.6.6': 'solc-0.6.6/soljson.js',
-  [require('solc/package.json').version]: 'solc/soljson.js',
-};
 
 function ok(data) {
   return { success: true, data };
@@ -235,9 +229,6 @@ async function downloadSoljson(version) {
 
 async function loadSolc(version) {
   const wrapper = require('solc/wrapper');
-  if (BUNDLED_SOLJSON[version]) {
-    return wrapper(require(BUNDLED_SOLJSON[version]));
-  }
   const cached = CACHE_DIR
     ? path.join(CACHE_DIR, 'solc-bin', `soljson-${version}.js`)
     : '';
@@ -251,7 +242,7 @@ async function loadSolc(version) {
     downloaded = await downloadSoljson(version);
   } catch (error) {
     throw new Error(
-      `solc ${version} is not bundled and could not be downloaded ` +
+      `solc ${version} could not be downloaded ` +
         `(${error instanceof Error ? error.message : String(error)}). ` +
         `Grant the plugin the 'net' permission for one compile so the ` +
         `compiler can be downloaded and cached.`

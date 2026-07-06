@@ -30,6 +30,9 @@ run_op getInfo
 run_op detect
 run_op getWatchPaths
 run_op install '{}' rw bridge
+# First compile downloads the repo's solc version into /cache (network);
+# the second proves the cached compiler works offline.
+run_op compile '{}' rw bridge
 run_op compile
 run_op listArtifacts
 
