@@ -35,10 +35,16 @@ the **Network** permission once; subsequent compiles run offline again.
 ## Protocol
 
 Ignite execs `node /plugin/index.js <operation>` inside the container, writes
-an options JSON object to stdin, and parses a single response object from
-stdout: `{ "success": true, "data": ... }` or
-`{ "success": false, "error": { "code", "message" } }`. The repository is
-mounted at `/workspace`.
+an options JSON object to stdin, and parses the response from stdout framed
+by sentinels (framing is mandatory):
+
+```
+<<<IGNITE_RESULT_BEGIN>>>{ "success": true, "data": ... }<<<IGNITE_RESULT_END>>>
+```
+
+All other stdout output is streamed into the user-visible job log (npm and
+compiler progress from this plugin shows up there). The repository is
+bind-mounted at `/workspace`.
 
 Implemented operations:
 
@@ -53,6 +59,8 @@ Implemented operations:
   solc metadata (`compilationTarget`)
 - `getArtifactData` — normalized artifact info (abi, creation/deployed
   bytecode, compiler settings, link references)
+- `getWatchPaths` — config/source/artifact locations core stat-fingerprints
+  on the host to detect when a recompile is needed
 
 ## Permissions
 

@@ -2,13 +2,15 @@
 // Ignite third-party compiler plugin for Waffle projects (e.g. Uniswap
 // v2-core and v2-periphery).
 //
-// Protocol (see Ignite's PluginExecutionUtils / finalizeImage):
+// Protocol (see Ignite's pluginTransport / plugin-runner / finalizeImage):
 //   - The operation name is the last argv element.
 //   - Options arrive as a JSON object on stdin (read to EOF).
-//   - Exactly one PluginResponse JSON object is written to stdout:
-//       { success: true, data } | { success: false, error: { code, message } }
-//   - Diagnostics go to stderr only.
-//   - The repository under compilation is mounted at /workspace.
+//   - The PluginResponse JSON is written to stdout framed by sentinels:
+//       <<<IGNITE_RESULT_BEGIN>>>{...}<<<IGNITE_RESULT_END>>>
+//     Framing is mandatory — there is no bare-JSON fallback.
+//   - Everything else on stdout is streamed into user-visible job logs
+//     (the sentinel block is filtered out); use it for progress output.
+//   - The repository under compilation is bind-mounted at /workspace.
 //   - Ignite provides a persistent per-plugin volume, advertised via
 //     $IGNITE_PLUGIN_CACHE (mounted at /cache).
 //
@@ -21,12 +23,13 @@
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
-const { execFile } = require('child_process');
-const { promisify } = require('util');
+const { spawn } = require('child_process');
 
-const execFileAsync = promisify(execFile);
+// Result framing sentinels (mirrors @ignite/plugin-types utils/protocol).
+const RESULT_BEGIN = '<<<IGNITE_RESULT_BEGIN>>>';
+const RESULT_END = '<<<IGNITE_RESULT_END>>>';
 
-const PLUGIN_VERSION = '0.2.0';
+const PLUGIN_VERSION = '0.3.0';
 const META = {
   id: 'waffle',
   type: 'compiler',
@@ -49,6 +52,11 @@ const BUNDLED_SOLJSON = {
 
 function ok(data) {
   return { success: true, data };
+}
+
+// Non-sentinel stdout is streamed into the job log — user-visible progress.
+function log(message) {
+  process.stdout.write(`${message}\n`);
 }
 
 function fail(code, message, details) {
@@ -218,10 +226,10 @@ async function loadSolc(version) {
     ? path.join(CACHE_DIR, 'solc-bin', `soljson-${version}.js`)
     : '';
   if (cached && fs.existsSync(cached)) {
-    process.stderr.write(`using cached solc ${version}\n`);
+    log(`using cached solc ${version}`);
     return wrapper(require(cached));
   }
-  process.stderr.write(`downloading solc ${version}...\n`);
+  log(`downloading solc ${version}...`);
   let downloaded;
   try {
     downloaded = await downloadSoljson(version);
@@ -262,23 +270,34 @@ async function install() {
 
   const args = ['install', '--omit=dev', '--no-audit', '--no-fund'];
   if (CACHE_DIR) args.push('--cache', path.join(CACHE_DIR, 'npm'));
-  try {
-    await execFileAsync('npm', args, {
+  log(`$ npm ${args.join(' ')}`);
+  const result = await new Promise((resolve) => {
+    // Stream npm's output live into the job log; capture the stderr tail for
+    // the error response.
+    const child = spawn('npm', args, {
       cwd: WORKSPACE,
-      maxBuffer: 16 * 1024 * 1024,
       env: { ...process.env, HOME: CACHE_DIR || '/tmp' },
     });
-    return ok({});
-  } catch (error) {
-    const stderr = (error && error.stderr) || '';
+    let stderrTail = '';
+    child.stdout.on('data', (c) => process.stdout.write(c));
+    child.stderr.on('data', (c) => {
+      process.stdout.write(c);
+      stderrTail = (stderrTail + c.toString()).slice(-2000);
+    });
+    child.on('error', (error) =>
+      resolve({ code: -1, stderrTail: String(error) })
+    );
+    child.on('close', (code) => resolve({ code, stderrTail }));
+  });
+  if (result.code !== 0) {
     return fail(
       'INSTALL_FAILED',
-      `npm install failed: ${
-        error instanceof Error ? error.message : String(error)
-      }. If this is a network error, grant the plugin the 'net' permission.`,
-      { stderr: String(stderr).slice(-2000) }
+      `npm install exited with ${result.code}. If this is a network error, ` +
+        `grant the plugin the 'net' permission.`,
+      { stderr: result.stderrTail }
     );
   }
+  return ok({});
 }
 
 async function compile() {
@@ -383,8 +402,29 @@ async function compile() {
       written++;
     }
   }
-  process.stderr.write(`compiled ${written} contracts with solc ${version}\n`);
+  log(`compiled ${written} contracts with solc ${version}`);
   return ok({});
+}
+
+// Workspace-relative locations core stat-fingerprints on the host to decide
+// when a recompile is needed. Resolved from the waffle config since source
+// and output directories are user-configurable; package.json is included
+// because it pins the solc version and the Solidity dependencies.
+function getWatchPaths() {
+  const stripDotSlash = (p) => p.replace(/^\.\//, '');
+  const config = loadConfig();
+  const configFiles = [];
+  const found = findConfigPath();
+  if (found) configFiles.push(path.basename(found));
+  else configFiles.push(...CONFIG_FILES);
+  configFiles.push('package.json');
+  return ok({
+    config: configFiles,
+    sources: [stripDotSlash(config ? config.sourceDirectory : './contracts')],
+    artifacts: [
+      stripDotSlash(config ? config.outputDirectory : './build'),
+    ],
+  });
 }
 
 function listArtifacts() {
@@ -510,6 +550,7 @@ const OPERATIONS = {
   compile,
   listArtifacts,
   getArtifactData,
+  getWatchPaths,
 };
 
 async function main() {
@@ -529,7 +570,9 @@ async function main() {
       );
     }
   }
-  process.stdout.write(JSON.stringify(response));
+  process.stdout.write(
+    `\n${RESULT_BEGIN}${JSON.stringify(response)}${RESULT_END}\n`
+  );
 }
 
 main();

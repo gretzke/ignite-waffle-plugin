@@ -28,6 +28,7 @@ run_op() {
 
 run_op getInfo
 run_op detect
+run_op getWatchPaths
 run_op install '{}' rw bridge
 run_op compile
 run_op listArtifacts
@@ -35,9 +36,10 @@ run_op listArtifacts
 ARTIFACT=$(echo '{}' | docker run --rm -i --network none \
   -v "$REPO:/workspace:ro" -v "$CACHE_VOLUME:/cache" -e IGNITE_PLUGIN_CACHE=/cache "$IMAGE" \
   node -e '
-    const r = JSON.parse(require("child_process").execSync(
-      "echo {} | node /plugin/index.js listArtifacts").toString());
-    const a = r.data.artifacts[0];
+    const out = require("child_process").execSync(
+      "echo {} | node /plugin/index.js listArtifacts").toString();
+    const m = out.match(/<<<IGNITE_RESULT_BEGIN>>>([\s\S]*?)<<<IGNITE_RESULT_END>>>/);
+    const a = JSON.parse(m[1]).data.artifacts[0];
     if (a) process.stdout.write(a.artifactPath);
   ')
 if [ -n "$ARTIFACT" ]; then
