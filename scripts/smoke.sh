@@ -50,7 +50,7 @@ if [ -n "$ARTIFACT" ]; then
 fi
 
 # Prove the permission model maps correctly: compile against a read-only
-# workspace must fail (this is what an ungranted hostWrite looks like).
+# workspace must fail (this is what an ungranted repoWrite looks like).
 echo "--- compile (workspace ro, expected to fail) ---" >&2
 echo '{}' | docker run --rm -i --network none \
   -v "$REPO:/workspace:ro" -v "$CACHE_VOLUME:/cache" -e IGNITE_PLUGIN_CACHE=/cache "$IMAGE" \

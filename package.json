@@ -1,6 +1,6 @@
 {
   "name": "ignite-waffle-plugin",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "private": true,
   "description": "Waffle compiler plugin for Ignite \u2014 compiles Solidity projects that use the Waffle toolchain",
   "main": "index.cjs",

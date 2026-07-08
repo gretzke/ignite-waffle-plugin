@@ -29,7 +29,7 @@ const { spawn } = require('child_process');
 const RESULT_BEGIN = '<<<IGNITE_RESULT_BEGIN>>>';
 const RESULT_END = '<<<IGNITE_RESULT_END>>>';
 
-const PLUGIN_VERSION = '0.5.1';
+const PLUGIN_VERSION = '0.5.2';
 const META = {
   id: 'waffle',
   type: 'compiler',
@@ -40,10 +40,11 @@ const META = {
   // grant dialog. Undeclared permissions can never be granted.
   permissions: [
     {
-      id: 'hostWrite',
+      id: 'repoWrite',
       description:
-        'Write compiled artifacts to the repository build directory and ' +
-        'install Solidity package dependencies into node_modules.',
+        'Write compiled artifacts to the build directory of the open ' +
+        'repository and install Solidity package dependencies into its ' +
+        'node_modules.',
     },
     {
       id: 'net',
@@ -264,7 +265,7 @@ function detect() {
 // Fetch the workspace's Solidity dependencies (e.g. @uniswap/v2-core for
 // v2-periphery) so package-style imports resolve at compile time. Dev
 // toolchain deps are skipped — the compiler ships in this image. Needs
-// hostWrite (granted for install) and network.
+// repoWrite (granted for install) and network.
 async function install() {
   const pkgPath = path.join(WORKSPACE, 'package.json');
   if (!fs.existsSync(pkgPath)) {

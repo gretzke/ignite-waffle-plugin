@@ -89,4 +89,4 @@ open a Waffle repository, and compile.
 
 Builds the image and runs every operation against the given repo with
 `--network none`, including a read-only compile that demonstrates the
-`hostWrite` failure mode.
+`repoWrite` failure mode.
